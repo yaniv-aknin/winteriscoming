@@ -1,0 +1,126 @@
+#!/usr/bin/env python
+
+"""Simple utility to create a filelist on one or more directory.
+
+The utility will spawn one worker process per source directory listed on the command line. It will create a filelist directory under each source directory, rotating one generation of previous filelist directories if any are found. It will proceed to create a list of files in the source into a filelist file in the filelist directory. Before exiting, the worker will "stamp" the filelist directory with an empty file, defaulting to be named as the current date. After all workers are done, the main process will copy all filelists from all sources to all filelist directories, for redundancy.
+
+This is useful to prepare for disaster on multiple disks: if one disk fails, you'll have a filelist on the other disks to at least know what you lost.
+"""
+
+from __future__ import print_function
+
+from multiprocessing import Process, Queue
+from Queue import Empty
+import argparse
+import os
+import shutil
+import sys
+import time
+
+RESULT_BUFFER_SIZE=1000
+PREFIX = '.filelist.d'
+OLD_PREFIX = PREFIX + 'old'
+
+class Message(object):
+    pass
+
+class Result(Message):
+    def __init__(self, filename):
+        self.filename = filename
+
+def parse_arguments(argv):
+    date = time.strftime('%Y-%m-%d')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('sources', nargs='+')
+    parser.add_argument('--allow-non-mountpoints', dest='pure_mounts', action='store_false', default=True)
+    parser.add_argument('--stamp', default=date)
+    options = parser.parse_args(argv[1:])
+    return options
+
+def worker(options, queue, source):
+    result = []
+    def flush(handle, result):
+        result.append('')
+        handle.write("\n".join(result))
+        del result[0:len(result)]
+    output = os.path.join(source, PREFIX, os.path.basename(source) + '.list')
+    with open(output, 'w') as handle:
+        for root, subdirectory, filenames in os.walk(source):
+            for filename in filenames:
+                result.append(os.path.join(root, filename))
+                if len(result) > RESULT_BUFFER_SIZE:
+                    flush(handle, result)
+        if result:
+            flush(handle, result)
+    open(os.path.join(source, PREFIX, options.stamp + '.stamp'), 'w').close()
+    queue.put(Result(output))
+
+def distribute_results(results, roots):
+    for source in results:
+        for root in roots:
+            destination = os.path.join(root, PREFIX, os.path.basename(source))
+            if source == destination:
+                continue
+            shutil.copy(source, destination)
+
+def spawn_workers(options):
+    for source in options.sources:
+        queue = Queue()
+        process = Process(target=worker, args=(options, queue, source))
+        process.start()
+        yield (queue, process)
+
+def manage_workers(workers):
+    while workers:
+        for queue, process in list(workers):
+            try:
+                message = queue.get_nowait()
+                if isinstance(message, Result):
+                    yield message.filename
+                    process.join()
+                    workers.remove((queue, process))
+                else:
+                    raise RuntimeError('unexpected message %r' % (message,))
+            except Empty:
+                continue
+        time.sleep(1)
+
+def rotate_list_dirs(source):
+    old_list_dir = os.path.join(source, OLD_PREFIX)
+    list_dir = os.path.join(source, PREFIX)
+    if os.path.exists(old_list_dir):
+        shutil.rmtree(old_list_dir)
+    if os.path.exists(list_dir):
+        os.rename(list_dir, old_list_dir)
+    os.mkdir(list_dir)
+        
+def validate_pure_mounts(sources):
+    try:
+        handle = open('/proc/mounts', 'r')
+    except IOError:
+        raise NotImplementedError('--allow-non-mountpoints required when /proc/mounts not available')
+    mounts = set()
+    for line in handle:
+        mounts.add(line.split()[1])
+    for source in sources:
+        if len(source.split()) != 1:
+            raise NotImplementedError('names with whitespaces unsupported')
+        if source not in mounts:
+            raise SystemExit('%s is not a mountpoint and --allow-non-mountpoints not given' % (source,))
+
+def main(options):
+    if options.pure_mounts:
+        validate_pure_mounts(options.sources)
+    for source in options.sources:
+        rotate_list_dirs(source)
+    results = []
+    workers = set(spawn_workers(options))
+    print('Spawned %d processes.' % (len(workers),))
+    for result in manage_workers(workers):
+        print("Output to %s finished." % (result,))
+        results.append(result)
+    distribute_results(results, options.sources)
+
+
+if __name__ == '__main__':
+    main(parse_arguments(sys.argv))
