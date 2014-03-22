@@ -1,0 +1,8 @@
+#!/usr/bin/env python
+
+import keepitcool
+
+keeper = keepitcool.CoolKeeper()
+keeper.run()
+if keeper.warning:
+    raise SystemExit(1)
